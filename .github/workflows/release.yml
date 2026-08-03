@@ -11,8 +11,19 @@
 # which still happens from the komm (client) repo's own release workflow,
 # checking out this repo's latest release tag and bundling that jar alongside
 # the client's own runtime/native-elevated packaging (jpackage + Inno Setup /
-# appimagetool). This workflow only produces the plain single-platform fat
-# jars used for the in-place self-update swap.
+# appimagetool).
+#
+# Windows and Linux need genuinely different self-update artifacts, not just
+# different natives: on Windows, the launcher's own code is a discrete jar
+# (app/komm-launcher.jar) inside an otherwise-untouched, writable install
+# directory, so the client can just overwrite that one file in place. On
+# Linux there is no equivalent — an AppImage is one opaque, read-only-mounted
+# unit — so "update the launcher" has to mean replacing the *entire*
+# .AppImage the client is running from. That's why this workflow builds a
+# plain jar for Windows but a full AppImage for Linux (seeded with whatever
+# the latest published client jar happens to be — irrelevant at runtime,
+# since an in-place swap never touches the already-installed client jar in
+# %APPDATA%, only a fresh install would ever read that seed).
 
 name: Release
 
@@ -52,14 +63,29 @@ jobs:
           mvn -B clean package -Pwin-natives,prod
           cp target/komm-launcher.jar komm-launcher-windows.jar
 
-      - name: Build Linux-native jar
+      - name: Get latest client jar (AppImage seed)
+        id: client-jar
         run: |
-          mvn -B clean package -Plinux-natives,prod
-          cp target/komm-launcher.jar komm-launcher-linux.jar
+          gh release download --repo B077AS/komm --pattern "komm-*.jar" --dir client-jar
+          echo "client_jar=$(ls client-jar/*.jar | head -1)" >> "$GITHUB_OUTPUT"
 
-      - name: Attach jars to the release
+      - name: Install appimagetool
+        run: |
+          mkdir -p ~/.local/bin
+          curl -Lo ~/.local/bin/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x ~/.local/bin/appimagetool
+
+      - name: Build Linux AppImage
+        run: |
+          mvn -B clean package -Pappimage,prod \
+            "-Dclient.version=${{ steps.v.outputs.version }}" \
+            "-Dclient.jar=${{ steps.client-jar.outputs.client_jar }}"
+          cp target/appimage/Komm-*.AppImage komm-launcher-linux.AppImage
+
+      - name: Attach artifacts to the release
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             komm-launcher-windows.jar \
-            komm-launcher-linux.jar \
+            komm-launcher-linux.AppImage \
             --clobber -R "$GITHUB_REPOSITORY"
