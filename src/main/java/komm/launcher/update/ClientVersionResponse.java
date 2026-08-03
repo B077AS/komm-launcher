@@ -10,4 +10,5 @@ import lombok.Data;
 public class ClientVersionResponse {
     private String version;
     private String downloadUrl;
+    private String sha256;
 }

@@ -1,0 +1,65 @@
+# Release pipeline for the Komm launcher itself.
+#
+# The launcher has no version identity outside of this: pom.xml's <version> is
+# never bumped in the tracked source, and jars are only ever built transiently
+# with the version set from the release tag (mirrors the komm client repo's
+# own release workflow). The two jars this uploads are what komm-hub's
+# LauncherReleaseSyncService polls for and what the client's LauncherUpdateService
+# downloads to self-update an already-installed launcher.
+#
+# Distinct from — and does not replace — the full installer/AppImage build,
+# which still happens from the komm (client) repo's own release workflow,
+# checking out this repo's latest release tag and bundling that jar alongside
+# the client's own runtime/native-elevated packaging (jpackage + Inno Setup /
+# appimagetool). This workflow only produces the plain single-platform fat
+# jars used for the in-place self-update swap.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Resolve version from release tag
+        id: v
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set Maven version from tag
+        run: mvn -B versions:set -DnewVersion="${{ steps.v.outputs.version }}" -DgenerateBackupPoms=false
+
+      - name: Build Windows-native jar
+        run: |
+          mvn -B clean package -Pwin-natives,prod
+          cp target/komm-launcher.jar komm-launcher-windows.jar
+
+      - name: Build Linux-native jar
+        run: |
+          mvn -B clean package -Plinux-natives,prod
+          cp target/komm-launcher.jar komm-launcher-linux.jar
+
+      - name: Attach jars to the release
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            komm-launcher-windows.jar \
+            komm-launcher-linux.jar \
+            --clobber -R "$GITHUB_REPOSITORY"
