@@ -14,8 +14,10 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Properties;
 import java.util.zip.ZipEntry;
@@ -161,6 +163,7 @@ public class UpdateManager {
         }
 
         long contentLength = res.headers().firstValueAsLong("Content-Length").orElse(-1);
+        MessageDigest digest = newSha256();
         try (InputStream in = res.body();
              var out = Files.newOutputStream(tmp)) {
             byte[] buffer = new byte[1 << 16];
@@ -168,6 +171,7 @@ public class UpdateManager {
             int read;
             while ((read = in.read(buffer)) != -1) {
                 out.write(buffer, 0, read);
+                if (digest != null) digest.update(buffer, 0, read);
                 total += read;
                 if (contentLength > 0) {
                     listener.onProgress((double) total / contentLength);
@@ -185,6 +189,16 @@ public class UpdateManager {
         if (downloadedVersion == null) {
             Files.deleteIfExists(tmp);
             throw new IllegalStateException("Downloaded jar is corrupt (no readable version)");
+        }
+        // Cryptographic check against the hash the hub computed for this same
+        // download — skipped if the hub didn't send one (e.g. not yet upgraded).
+        String expectedSha256 = latest.getSha256();
+        if (expectedSha256 != null && !expectedSha256.isBlank() && digest != null) {
+            String actualSha256 = HexFormat.of().formatHex(digest.digest());
+            if (!expectedSha256.trim().equalsIgnoreCase(actualSha256)) {
+                Files.deleteIfExists(tmp);
+                throw new IllegalStateException("Downloaded jar failed integrity check");
+            }
         }
         Path jar = Launcher.getClientJar();
         Files.move(tmp, jar, StandardCopyOption.REPLACE_EXISTING);
@@ -219,6 +233,12 @@ public class UpdateManager {
         String javaBin = resolveJavaBinary();
         List<String> command = new ArrayList<>();
         command.add(javaBin);
+        // Lets the client tell whether the launcher that started it needs updating —
+        // absent entirely on an old/unpatched launcher, which the client treats as stale.
+        String launcherVersion = config.getLauncherVersion();
+        if (launcherVersion != null && !launcherVersion.isBlank()) {
+            command.add("-Dlauncher.version=" + launcherVersion);
+        }
         command.add("-jar");
         command.add(jar.toAbsolutePath().toString());
         // Forward any deep-link args (e.g. komm://invite/...) the launcher was opened with.
@@ -279,6 +299,17 @@ public class UpdateManager {
         Path candidate = javaHome.resolve("bin").resolve(win ? "javaw.exe" : "java");
         if (Files.exists(candidate)) return candidate.toAbsolutePath().toString();
         return win ? "javaw" : "java";
+    }
+
+    /** SHA-256 instance for hashing a download in-flight, or null if unavailable
+     *  (every JDK provides it, but the integrity check is best-effort either way). */
+    private static MessageDigest newSha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (Exception e) {
+            log.warn("SHA-256 unavailable, skipping download integrity check: {}", e.toString());
+            return null;
+        }
     }
 
     /** Jar entry + property carrying the client's version — the same

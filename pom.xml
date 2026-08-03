@@ -175,6 +175,34 @@
             </dependencies>
         </profile>
 
+        <!-- Single-platform fat jars with no packaging steps attached — unlike
+             installer/appimage below (which bundle the full jpackage/Inno-Setup/
+             appimagetool pipeline in the same package phase), these just produce
+             target/komm-launcher.jar for the launcher's own release workflow to
+             upload as a release asset (the self-update download). -->
+        <profile>
+            <id>win-natives</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.openjfx</groupId>
+                    <artifactId>javafx-graphics</artifactId>
+                    <version>${javafx.version}</version>
+                    <classifier>win</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+        <profile>
+            <id>linux-natives</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.openjfx</groupId>
+                    <artifactId>javafx-graphics</artifactId>
+                    <version>${javafx.version}</version>
+                    <classifier>linux</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+
         <profile>
             <id>installer</id>
             <properties>
@@ -436,6 +464,11 @@
     </profiles>
 
     <build>
+        <!-- Pinned (not the artifactId-version default) so every version produces
+             an identically-named jar inside the jpackage app-image (app/komm-launcher.jar) —
+             the launcher's own self-update swaps that file in place by name, which only
+             works if the name never changes between versions. -->
+        <finalName>komm-launcher</finalName>
         <!-- Only app.properties is filtered, so ${hub.url} lands in its api.url
              entry at build time; everything else is copied verbatim (blanket
              filtering would corrupt binary resources). Mirrors the komm client. -->

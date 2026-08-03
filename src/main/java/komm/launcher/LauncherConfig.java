@@ -51,4 +51,9 @@ public class LauncherConfig {
         if (override != null && !override.isBlank()) return override.trim();
         return properties.getProperty("api.url");
     }
+
+    /** This launcher's own version, forwarded to the client as -Dlauncher.version. */
+    public String getLauncherVersion() {
+        return properties.getProperty("launcher.version");
+    }
 }
