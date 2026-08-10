@@ -30,7 +30,7 @@
     -fx-border-radius: 14;
     -fx-border-color: -color-border-subtle;
     -fx-border-width: 1;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.55), 36, 0.18, 0, 12);
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.5), 36, 0.05, 0, 12);
 }
 
 .launcher-title {
