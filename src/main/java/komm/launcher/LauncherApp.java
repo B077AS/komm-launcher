@@ -69,9 +69,9 @@ public class LauncherApp extends Application implements UpdateManager.Listener {
 
         StackPane root = new StackPane(buildCard());
         root.getStyleClass().add("launcher-root");
-        root.setPadding(new Insets(24)); // breathing room for the card's drop shadow
+        root.setPadding(new Insets(30, 40, 52, 40));
 
-        Scene scene = new Scene(root, 408, 452);
+        Scene scene = new Scene(root, 440, 486);
         scene.setFill(javafx.scene.paint.Color.TRANSPARENT);
         scene.setOnKeyPressed(e -> {
             if (e.getCode() == KeyCode.ESCAPE) closeLauncher();

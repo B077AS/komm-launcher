@@ -57,16 +57,40 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 └──────────────┘
 ```
 
-1. **Check** — `GET {hub}/api/client/latest` returns `{ version, downloadUrl }`. On the hub side this is `ClientUpdateController`, which reads the version straight out of the client JAR it hosts.
+1. **Check** — `GET {hub}/api/client/latest` returns `{ version, downloadUrl, sha256 }`. On the hub side this is `ClientUpdateController`, backed by a `ClientReleaseSyncService` that polls the [komm](https://github.com/B077AS/komm) repo's GitHub releases and mirrors the jar locally — no one has to manually place it there (see the hub's own README for details).
 2. **Compare** — against the `client.version` embedded in the installed JAR's `app.properties`. The JAR is **self-describing** — launcher and hub read the *same* entry, so there is no separate version file to drift out of sync.
-3. **Download** — if the installed JAR is missing or stale, the new one streams to `komm.jar.download` with determinate progress, is verified (it must be able to state its own version — a truncated or corrupt download is discarded, never installed), then atomically replaces `komm.jar`.
+3. **Download** — if the installed JAR is missing or stale, the new one streams to `komm.jar.download` with determinate progress, is verified (it must be able to state its own version, and its SHA-256 must match what the hub reported — a truncated, corrupt or tampered download is discarded, never installed), then atomically replaces `komm.jar`.
 4. **Launch** — the client starts on the bundled runtime with any `komm://…` deep-link arguments forwarded, and the launcher closes.
 
 ### The update rules
 
 - **Every update is mandatory.** Once the hub has announced a newer version, a failed download shows an error — the launcher never falls back to a known-stale client. Everyone on the network runs the current version.
 - **Offline is fine.** Only when the hub itself is unreachable (you're offline, or the hub is down) does an already-installed client launch as-is.
-- **A corrupt download never replaces a working install.** The downloaded JAR must prove it can state its own version before it's moved into place.
+- **A corrupt download never replaces a working install.** The downloaded JAR must prove it can state its own version, and match the expected checksum, before it's moved into place.
+
+## How the launcher updates itself
+
+Everything above updates the *client*. But the launcher binary itself — the installer/AppImage you actually have on disk — has no equivalent "check on every start," because by the time there'd be anything to check, the launcher has already handed off to the client and exited. So **the client checks on the launcher's behalf**, once per start, and swaps it in the background:
+
+```
+┌──────────────┐  -Dlauncher.version=X   ┌──────────────┐  GET /api/launcher/latest?os=…   ┌──────────────┐
+│   Launcher   │ ──────────────────────► │ komm client  │ ────────────────────────────────►│   komm-hub   │
+│  (this repo) │   forwarded at launch   │  (komm.jar)  │◄────────────────────────────────  │              │
+└──────────────┘                         └──────┬───────┘  { version, sha256, downloadUrl } └──────────────┘
+                                                 │
+                                                 │  stale (or version missing entirely)?
+                                                 │  download, verify sha256, swap — in the background
+                                                 ▼
+                                   Windows: overwrite app/komm-launcher.jar
+                                   Linux:   overwrite the .AppImage at $APPIMAGE
+```
+
+- **The launcher is self-describing**, the same way the client JAR is — `launcher.version` in `app.properties`, set from this repo's own GitHub release tag at build time (see [Under the hood](#under-the-hood): `LauncherConfig.getLauncherVersion()`). `UpdateManager` forwards it to the client as `-Dlauncher.version=...` when spawning it.
+- **A missing version means "definitely outdated."** Launchers built before this existed simply don't pass the flag at all — the client treats that exactly like this repo's own `UpdateManager` treats a missing client version: assume stale, update.
+- **Windows and Linux need genuinely different artifacts, not just different natives.** On Windows, the launcher's own code is a discrete jar (`app/komm-launcher.jar`) inside an otherwise-untouched install directory, so the client just overwrites that one file — safe even while the client is running, since the launcher process that loaded it has already exited (`closeLauncher()` calls `System.exit()` right after spawning the client). On Linux there's no equivalent: an AppImage is one opaque, read-only-mounted unit, so "update the launcher" means replacing the *entire* `.AppImage` the client is running from — also safe while mounted, thanks to ordinary POSIX unlink-while-open semantics: the running instance keeps working off the old file until it next exits, the *path* just points somewhere new from then on.
+- **Old installs self-repair, once.** Installs built before the launcher jar's filename was pinned to a constant (`komm-launcher.jar` — see `<finalName>` in `pom.xml`) have jpackage's `Komm.cfg` pointing at the old versioned name (`komm-launcher-0.0.1.jar`, etc.). The first swap on such an install also repoints `Komm.cfg` and deletes the stale jar; after that it's permanently on the fixed-name scheme and every future update is a plain file swap.
+- **No UI, no restart prompt.** The swap is entirely passive — the new version is picked up the next time the user launches through the (already-updated) launcher, whenever that is.
+- **This is why the launcher has its own release pipeline** — `.github/workflows/release.yml` in *this* repo, separate from the client's, publishing `komm-launcher-windows.jar` and `komm-launcher-linux.AppImage` on every launcher release. It's deliberately decoupled from client release cadence, so a launcher-only fix reaches every installed user — even the very first launcher ever shipped — without waiting on the next client release.
 
 ## Invite links (`komm://`)
 
@@ -152,13 +176,24 @@ Both profiles accept the same overrides for which client to seed:
 mvn clean package -Pinstaller -Dclient.version=0.0.2 -Dclient.jar=C:\path\komm.jar
 ```
 
+### Self-update artifacts
+
+Two more profiles exist purely for [the launcher's own self-update pipeline](#how-the-launcher-updates-itself) — they carry only the platform-specific JavaFX natives, none of the installer/AppImage packaging steps, and just produce the plain fat jar:
+
+```bash
+mvn clean package -Pwin-natives,prod    # target/komm-launcher.jar, Windows natives
+mvn clean package -Plinux-natives,prod  # target/komm-launcher.jar, Linux natives
+```
+
+`.github/workflows/release.yml` in this repo uses these to build `komm-launcher-windows.jar` directly, and (via the existing `appimage` profile, seeded with whatever the latest published [komm](https://github.com/B077AS/komm) client jar happens to be) `komm-launcher-linux.AppImage`.
+
 ## Under the hood
 
 | Class | Responsibility |
 |---|---|
 | `Launcher` | Entry point — resolves app-data dirs, wires logging, hands off to the UI |
 | `LauncherApp` | The frameless JavaFX window: phases, progress bar, animations; closes on ✕ or Esc |
-| `LauncherConfig` | Reads `app.properties` (`api.url`), overridable via `-Dapi.url=` |
+| `LauncherConfig` | Reads `app.properties` (`api.url`, `launcher.version`), overridable via `-Dapi.url=` |
 | `update/UpdateManager` | The whole check → download → verify → install → launch sequence on a worker thread |
 | `update/BundledClientSeeder` | First-run copy of the bundled client seed into the app-data dir |
 | `update/Phase` | The six status phrases (`CHECKING`, `DOWNLOADING`, `INSTALLING`, `STARTING`, `UP_TO_DATE`, `DONE`) |
@@ -198,6 +233,8 @@ mvn clean package -Pinstaller -Dclient.version=0.0.2 -Dclient.jar=C:\path\komm.j
 **What happens if an update download fails mid-way?** Nothing bad — the download goes to a temporary file and is verified before it replaces anything. Your working install is only ever replaced by a JAR that proved it's intact. If the hub has announced a new version, though, the update is mandatory: the launcher shows an error rather than starting an outdated client.
 
 **Can I use the launcher with my own hub?** Yes — pass `-Dapi.url=http://my-hub:8085` in dev, or bake your hub into the package with `-Dhub.url=http://my-hub:8085` at build time (the `prod` profile is just this, preset to the official hub).
+
+**How does the launcher itself get updated?** See [How the launcher updates itself](#how-the-launcher-updates-itself) — in short, the *client* checks on the launcher's behalf once per start and swaps it in the background, since the launcher process itself is already gone by the time the client is running.
 
 ## License
 
