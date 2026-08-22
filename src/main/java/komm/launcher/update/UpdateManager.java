@@ -4,6 +4,10 @@ import com.google.gson.Gson;
 import com.sun.jna.Platform;
 import komm.launcher.Launcher;
 import komm.launcher.LauncherConfig;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.InputStream;
@@ -27,23 +31,25 @@ import java.util.zip.ZipFile;
  * Drives the whole launcher sequence on a background thread:
  *
  * <ol>
- *   <li>ask the hub for the latest client version ({@code GET /api/client/latest}),</li>
- *   <li>compare it to the {@code client.version} embedded in the installed jar's
- *       {@code app.properties} — the same self-describing entry the hub reads,</li>
- *   <li>download + replace the jar if it's missing or stale
- *       ({@code GET /api/client/download}),</li>
+ *   <li>ask GitHub for the client repo's latest release
+ *       ({@code GET api.github.com/repos/{owner}/{repo}/releases/latest}),</li>
+ *   <li>compare its tag to the {@code client.version} embedded in the installed
+ *       jar's {@code app.properties} — the same self-describing entry the
+ *       client's own build filters in,</li>
+ *   <li>download + replace the jar if it's missing or stale, verifying it
+ *       against the SHA-256 digest GitHub reports for that release asset,</li>
  *   <li>launch the client jar and exit.</li>
  * </ol>
  *
- * <p>Every update is mandatory: once the hub has announced a newer version, a
+ * <p>Every update is mandatory: once GitHub has announced a newer version, a
  * failed download shows an error instead of falling back to the stale jar. Only
- * when the hub itself is unreachable does an already-installed jar launch as-is.
+ * when GitHub itself is unreachable does an already-installed jar launch as-is.
  *
  * <p>All progress is reported through {@link Listener}; callbacks fire on the
  * background thread, so the UI marshals them onto the FX thread itself.
  *
- * <p>A scripted {@link #runDemo()} reproduces the same visuals without a hub or a
- * real jar, so the look &amp; feel can be reviewed in isolation.
+ * <p>A scripted {@link #runDemo()} reproduces the same visuals without a network
+ * call or a real jar, so the look &amp; feel can be reviewed in isolation.
  */
 @Slf4j
 public class UpdateManager {
@@ -62,6 +68,10 @@ public class UpdateManager {
         void onLaunched();
     }
 
+    /** Public GitHub repo the client is released from — overridable for testing against a fork. */
+    private static final String GITHUB_CLIENT_OWNER = systemPropertyOr("github.client.owner", "B077AS");
+    private static final String GITHUB_CLIENT_REPO = systemPropertyOr("github.client.repo", "komm");
+
     private final LauncherConfig config = LauncherConfig.getInstance();
     private final Gson gson = new Gson();
     private final HttpClient http = HttpClient.newBuilder()
@@ -72,6 +82,22 @@ public class UpdateManager {
 
     private final Listener listener;
     private final String[] clientArgs;
+
+    private static String systemPropertyOr(String key, String fallback) {
+        String value = System.getProperty(key);
+        return value == null || value.isBlank() ? fallback : value.trim();
+    }
+
+    /** What {@link #fetchLatest()} resolves a GitHub release down to. */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    private static class ResolvedRelease {
+        private String version;
+        private String downloadUrl;
+        private String sha256;
+    }
 
     public UpdateManager(Listener listener, String[] clientArgs) {
         this.listener = listener;
@@ -85,7 +111,7 @@ public class UpdateManager {
         deleteLegacyVersionFile();
 
         Path jar = Launcher.getClientJar();
-        // Flipped once the hub has announced a version we don't have; from that
+        // Flipped once GitHub has announced a version we don't have; from that
         // point on the stale jar is never launched as a fallback.
         boolean updateRequired = false;
 
@@ -93,7 +119,7 @@ public class UpdateManager {
             listener.onPhase(Phase.CHECKING);
             pause(450); // let the phrase land, Discord-style
 
-            ClientVersionResponse latest = fetchLatest();
+            ResolvedRelease latest = fetchLatest();
             String localVersion = readVersionFromJar(jar);
             log.info("Local version={}, latest version={}", localVersion, latest.getVersion());
 
@@ -116,8 +142,8 @@ public class UpdateManager {
 
         } catch (Exception e) {
             log.warn("Update flow failed: {}", e.toString());
-            // Hub unreachable (offline, hub down): run what we already have. A
-            // known-stale jar is never launched — the error stays on screen.
+            // GitHub unreachable (offline, GitHub down, rate-limited): run what we
+            // already have. A known-stale jar is never launched — the error stays on screen.
             if (!updateRequired && Files.exists(jar)) {
                 try {
                     listener.onPhase(Phase.STARTING);
@@ -133,22 +159,46 @@ public class UpdateManager {
         }
     }
 
-    private ClientVersionResponse fetchLatest() throws Exception {
-        String url = config.getApiUrl().replaceAll("/+$", "") + "/api/client/latest";
+    /** {@code GET /repos/{owner}/{repo}/releases/latest}, resolved down to the jar asset this launcher wants. */
+    private ResolvedRelease fetchLatest() throws Exception {
+        String url = "https://api.github.com/repos/" + GITHUB_CLIENT_OWNER + "/" + GITHUB_CLIENT_REPO + "/releases/latest";
         log.debug("GET {}", url);
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url)).GET().build();
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .GET().build();
         HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (res.statusCode() != 200) {
-            throw new IllegalStateException("Hub returned HTTP " + res.statusCode());
+            throw new IllegalStateException("GitHub returned HTTP " + res.statusCode());
         }
-        ClientVersionResponse parsed = gson.fromJson(res.body(), ClientVersionResponse.class);
-        if (parsed == null || parsed.getDownloadUrl() == null) {
-            throw new IllegalStateException("Malformed version response");
+        GithubRelease release = gson.fromJson(res.body(), GithubRelease.class);
+        if (release == null || release.getTagName() == null) {
+            throw new IllegalStateException("Malformed GitHub release response");
         }
-        return parsed;
+        String tagName = release.getTagName();
+        String version = tagName.startsWith("v") ? tagName.substring(1) : tagName;
+
+        // The client's own release workflow names the asset after the tag it was
+        // built from, so the expected name is derivable without a second request.
+        String expectedAssetName = "komm-" + version + ".jar";
+        GithubRelease.GithubAsset asset = release.findAsset(expectedAssetName);
+        if (asset == null || asset.getBrowserDownloadUrl() == null) {
+            throw new IllegalStateException("Release " + version + " has no asset named " + expectedAssetName + " yet");
+        }
+        // GitHub computes and returns this itself for every uploaded asset — no
+        // separate checksum file needed.
+        String sha256 = asset.getDigest();
+        if (sha256 != null && sha256.startsWith("sha256:")) {
+            sha256 = sha256.substring("sha256:".length());
+        }
+        return ResolvedRelease.builder()
+                .version(version)
+                .downloadUrl(asset.getBrowserDownloadUrl())
+                .sha256(sha256)
+                .build();
     }
 
-    private void downloadAndInstall(ClientVersionResponse latest) throws Exception {
+    private void downloadAndInstall(ResolvedRelease latest) throws Exception {
         listener.onPhase(Phase.DOWNLOADING);
         listener.onProgress(0);
 
@@ -190,8 +240,8 @@ public class UpdateManager {
             Files.deleteIfExists(tmp);
             throw new IllegalStateException("Downloaded jar is corrupt (no readable version)");
         }
-        // Cryptographic check against the hash the hub computed for this same
-        // download — skipped if the hub didn't send one (e.g. not yet upgraded).
+        // Cryptographic check against GitHub's own per-asset digest — skipped only
+        // if GitHub didn't report one (older uploads predating this feature).
         String expectedSha256 = latest.getSha256();
         if (expectedSha256 != null && !expectedSha256.isBlank() && digest != null) {
             String actualSha256 = HexFormat.of().formatHex(digest.digest());
@@ -313,7 +363,7 @@ public class UpdateManager {
     }
 
     /** Jar entry + property carrying the client's version — the same
-     *  self-describing {@code app.properties} the hub reads on its side. */
+     *  self-describing {@code app.properties} the client's build filters in. */
     private static final String PROPERTIES_ENTRY = "app.properties";
     private static final String VERSION_PROPERTY = "client.version";
 

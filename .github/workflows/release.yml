@@ -60,7 +60,7 @@ jobs:
 
       - name: Build Windows-native jar
         run: |
-          mvn -B clean package -Pwin-natives,prod
+          mvn -B clean package -Pwin-natives
           cp target/komm-launcher.jar komm-launcher-windows.jar
 
       - name: Get latest client jar (AppImage seed)
@@ -78,7 +78,7 @@ jobs:
 
       - name: Build Linux AppImage
         run: |
-          mvn -B clean package -Pappimage,prod \
+          mvn -B clean package -Pappimage \
             "-Dclient.version=${{ steps.v.outputs.version }}" \
             "-Dclient.jar=${{ steps.client-jar.outputs.client_jar }}"
           cp target/appimage/Komm-*.AppImage komm-launcher-linux.AppImage

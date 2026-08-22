@@ -8,8 +8,9 @@ import lombok.extern.slf4j.Slf4j;
 
 /**
  * Reads the bundled {@code app.properties}, mirroring the komm client's
- * {@code AppConfig}. The only value the launcher needs is {@code api.url} — the
- * hub base it asks for client updates.
+ * {@code AppConfig}. The only value the launcher needs from it is its own
+ * {@code launcher.version} — update checks now go straight to GitHub (see
+ * {@code update.UpdateManager}) rather than through a configured hub.
  */
 @Slf4j
 public class LauncherConfig {
@@ -43,13 +44,6 @@ public class LauncherConfig {
         } catch (IOException e) {
             log.error("Error loading properties: {}", e.getMessage());
         }
-    }
-
-    public String getApiUrl() {
-        // A -Dapi.url=... override wins, so testers can point at any hub without rebuilding.
-        String override = System.getProperty("api.url");
-        if (override != null && !override.isBlank()) return override.trim();
-        return properties.getProperty("api.url");
     }
 
     /** This launcher's own version, forwarded to the client as -Dlauncher.version. */

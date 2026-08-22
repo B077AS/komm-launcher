@@ -36,8 +36,8 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 
 ## What the launcher does
 
-- **Checks for updates on every start** — asks the hub for the latest client version and swaps in the new JAR automatically, with a live progress bar
-- **Works offline** — a bundled client seed makes the very first start work without internet; later, if the hub is unreachable, the installed client launches as-is
+- **Checks for updates on every start** — asks GitHub for the client repo's latest release and swaps in the new JAR automatically, with a live progress bar
+- **Works offline** — a bundled client seed makes the very first start work without internet; later, if GitHub is unreachable, the installed client launches as-is
 - **Never breaks your install** — downloads are verified before they replace anything, and the swap is atomic (see [The update rules](#the-update-rules))
 - **Handles invite links** — registers the `komm://` URI scheme so browser links like `komm://invite/CODE` open the launcher, which forwards them to the client
 - **Ships its own Java** — installer and AppImage carry a private jlink runtime shared by launcher and client, so users never install Java
@@ -46,13 +46,13 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 ## How an update works
 
 ```
-┌──────────────┐  1. GET /api/client/latest   ┌──────────────┐
-│   Launcher   │ ───────────────────────────► │   komm-hub   │  ← hosts the latest
-│  (this repo) │ ◄─────────────────────────── │              │    client fat JAR
-└──────┬───────┘   { version, downloadUrl }   └──────────────┘
+┌──────────────┐  1. GET api.github.com/repos/…/releases/latest  ┌──────────────┐
+│   Launcher   │ ───────────────────────────────────────────────►│    GitHub    │  ← hosts the client's
+│  (this repo) │ ◄───────────────────────────────────────────────│              │    releases + assets
+└──────┬───────┘   { tag_name, assets: [{ name, url, digest }] } └──────────────┘
        │
-       │  2. stale/missing? stream /api/client/download,
-       │     verify the download, atomically swap komm.jar
+       │  2. stale/missing? stream the asset's browser_download_url,
+       │     verify against GitHub's own digest, atomically swap komm.jar
        ▼
 ┌──────────────┐
 │ komm client  │  3. launched on the bundled runtime,
@@ -60,15 +60,15 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 └──────────────┘
 ```
 
-1. **Check** — `GET {hub}/api/client/latest` returns `{ version, downloadUrl, sha256 }`. On the hub side this is `ClientUpdateController`, backed by a `ClientReleaseSyncService` that polls the [komm](https://github.com/B077AS/komm) repo's GitHub releases and mirrors the jar locally — no one has to manually place it there (see the hub's own README for details).
-2. **Compare** — against the `client.version` embedded in the installed JAR's `app.properties`. The JAR is **self-describing** — launcher and hub read the *same* entry, so there is no separate version file to drift out of sync.
-3. **Download** — if the installed JAR is missing or stale, the new one streams to `komm.jar.download` with determinate progress, is verified (it must be able to state its own version, and its SHA-256 must match what the hub reported — a truncated, corrupt or tampered download is discarded, never installed), then atomically replaces `komm.jar`.
+1. **Check** — `GET api.github.com/repos/B077AS/komm/releases/latest` returns the release's tag and its assets, each with a `browser_download_url` and a `digest` GitHub computes itself. No hub, sync service, or manual jar placement involved — GitHub *is* the source of truth.
+2. **Compare** — the tag (minus a leading `v`) against the `client.version` embedded in the installed JAR's `app.properties`. The JAR is **self-describing** — launcher and client build read the *same* entry, so there is no separate version file to drift out of sync.
+3. **Download** — if the installed JAR is missing or stale, the new one streams to `komm.jar.download` with determinate progress, is verified (it must be able to state its own version, and its SHA-256 must match the `sha256:<hex>` digest GitHub reported for that asset — a truncated, corrupt or tampered download is discarded, never installed), then atomically replaces `komm.jar`.
 4. **Launch** — the client starts on the bundled runtime with any `komm://…` deep-link arguments forwarded, and the launcher closes.
 
 ### The update rules
 
-- **Every update is mandatory.** Once the hub has announced a newer version, a failed download shows an error — the launcher never falls back to a known-stale client. Everyone on the network runs the current version.
-- **Offline is fine.** Only when the hub itself is unreachable (you're offline, or the hub is down) does an already-installed client launch as-is.
+- **Every update is mandatory.** Once GitHub has announced a newer release, a failed download shows an error — the launcher never falls back to a known-stale client. Everyone on the network runs the current version.
+- **Offline is fine.** Only when GitHub itself is unreachable (you're offline, GitHub is down, or the unauthenticated API rate limit was hit) does an already-installed client launch as-is.
 - **A corrupt download never replaces a working install.** The downloaded JAR must prove it can state its own version, and match the expected checksum, before it's moved into place.
 
 ## How the launcher updates itself
@@ -76,13 +76,14 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 Everything above updates the *client*. But the launcher binary itself — the installer/AppImage you actually have on disk — has no equivalent "check on every start," because by the time there'd be anything to check, the launcher has already handed off to the client and exited. So **the client checks on the launcher's behalf**, once per start, and swaps it in the background:
 
 ```
-┌──────────────┐  -Dlauncher.version=X   ┌──────────────┐  GET /api/launcher/latest?os=…   ┌──────────────┐
-│   Launcher   │ ──────────────────────► │ komm client  │ ────────────────────────────────►│   komm-hub   │
-│  (this repo) │   forwarded at launch   │  (komm.jar)  │◄────────────────────────────────  │              │
-└──────────────┘                         └──────┬───────┘  { version, sha256, downloadUrl } └──────────────┘
+┌──────────────┐  -Dlauncher.version=X   ┌──────────────┐  GET api.github.com/repos/…/releases/latest  ┌──────────────┐
+│   Launcher   │ ──────────────────────► │ komm client  │ ─────────────────────────────────────────────►│    GitHub    │
+│  (this repo) │   forwarded at launch   │  (komm.jar)  │◄────────────────────────────────────────────  │              │
+└──────────────┘                         └──────┬───────┘  { tag_name, assets: [{ name, url, digest }] } └──────────────┘
                                                  │
                                                  │  stale (or version missing entirely)?
-                                                 │  download, verify sha256, swap — in the background
+                                                 │  download the per-OS asset, verify against GitHub's
+                                                 │  digest, swap — in the background
                                                  ▼
                                    Windows: overwrite app/komm-launcher.jar
                                    Linux:   overwrite the .AppImage at $APPIMAGE
@@ -119,7 +120,7 @@ Komm-Setup-<version>.exe  /  Komm-<version>-x86_64.AppImage
                                (Windows; shows as "Komm" in Task Manager)
 ```
 
-- **The client seed** makes the first start work offline: on first run, `BundledClientSeeder` copies it into the app-data directory, after which the normal hub-update flow owns the JAR. The installer/AppImage is named after the client version it seeds (it's published on the client's release page) — but any old installer stays valid forever, because the launcher updates the client on first contact anyway.
+- **The client seed** makes the first start work offline: on first run, `BundledClientSeeder` copies it into the app-data directory, after which the normal GitHub-update flow owns the JAR. The installer/AppImage is named after the client version it seeds (it's published on the client's release page) — but any old installer stays valid forever, because the launcher updates the client on first contact anyway.
 - **The private runtime is shared** by launcher and client — the launcher starts the client with its own `java.home`'s `javaw`/`java`, so users never install or update Java. (Both jpackage profiles override `--jlink-options` to keep native launchers like `bin/java` in the runtime, which jpackage strips by default.)
 - **Task Manager branding (Windows)** — the build rewrites a copy of the runtime's `javaw.exe` into `runtime/bin/Komm.exe` with [rcedit](https://github.com/electron/rcedit) (icon + version resources), and the launcher prefers that copy when launching the client. Result: the client appears as **Komm** in Task Manager instead of "Java Platform SE binary".
 - **AppImage mount guard (Linux)** — an AppImage's FUSE mount only lives as long as the process that started it, but the client runs off the mounted runtime. When the launcher detects it's running from an AppImage, a non-daemon `appimage-mount-keeper` thread keeps the (window-less) launcher process alive until the client exits, so the runtime never vanishes underneath it.
@@ -138,26 +139,25 @@ The launcher creates the app-data directory shared with the client — `%APPDATA
 Requirements: **Java 21** and Maven.
 
 ```bash
-# Dev run — checks the hub, downloads/updates the client jar, launches it
+# Dev run — checks GitHub, downloads/updates the client jar, launches it
 mvn javafx:run
 
-# Scripted visual demo — walks every phase with fake progress, no hub or jar needed
+# Scripted visual demo — walks every phase with fake progress, no network or jar needed
 mvn javafx:run -Dlauncher.demo=true
 
-# Point at a different hub without editing app.properties
-mvn javafx:run -Dapi.url=http://my-hub:8085
+# Point at a fork's releases instead of B077AS/komm without rebuilding
+mvn javafx:run -Dgithub.client.owner=you -Dgithub.client.repo=komm
 
 # Fat jar with Windows + Linux JavaFX natives bundled
 mvn clean package -Ppackage
 ```
 
-By default the launcher points at a hub on `localhost:8085` — the pom's `hub.url` property is baked into `app.properties` at build time, and the **`prod` profile** switches it to the official hub (`https://kommvoice.com`); `-Dapi.url=` always wins over the baked value for dev runs. The prod URL ends up only inside the built jar: after packaging, the profile restores the localhost value in `target/classes`, so IDE runs of the main class stay on your local hub. To develop end-to-end, run a local [komm-hub](https://github.com/B077AS/komm-hub) with a client JAR configured, or point at the official hub.
+The launcher always checks GitHub directly (`api.github.com/repos/B077AS/komm/releases/latest`) — there's no hub URL to configure or bake in. To point a dev build at your own fork instead, pass `-Dgithub.client.owner=`/`-Dgithub.client.repo=` (see [Under the hood](#under-the-hood)).
 
 ### Windows installer
 
 ```bash
-mvn clean package -Pinstaller,prod   # production: baked for https://kommvoice.com
-mvn clean package -Pinstaller        # dev: baked for localhost:8085
+mvn clean package -Pinstaller
 # → target/installer/Komm-Setup-<client.version>.exe
 ```
 
@@ -166,8 +166,7 @@ Needs the [komm](https://github.com/B077AS/komm) client fat JAR built next door 
 ### Linux AppImage
 
 ```bash
-mvn clean package -Pappimage,prod    # production: baked for https://kommvoice.com
-mvn clean package -Pappimage         # dev: baked for localhost:8085
+mvn clean package -Pappimage
 # → target/appimage/Komm-<client.version>-x86_64.AppImage
 ```
 
@@ -184,8 +183,8 @@ mvn clean package -Pinstaller -Dclient.version=0.0.2 -Dclient.jar=C:\path\komm.j
 Two more profiles exist purely for [the launcher's own self-update pipeline](#how-the-launcher-updates-itself) — they carry only the platform-specific JavaFX natives, none of the installer/AppImage packaging steps, and just produce the plain fat jar:
 
 ```bash
-mvn clean package -Pwin-natives,prod    # target/komm-launcher.jar, Windows natives
-mvn clean package -Plinux-natives,prod  # target/komm-launcher.jar, Linux natives
+mvn clean package -Pwin-natives    # target/komm-launcher.jar, Windows natives
+mvn clean package -Plinux-natives  # target/komm-launcher.jar, Linux natives
 ```
 
 `.github/workflows/release.yml` in this repo uses these to build `komm-launcher-windows.jar` directly, and (via the existing `appimage` profile, seeded with whatever the latest published [komm](https://github.com/B077AS/komm) client jar happens to be) `komm-launcher-linux.AppImage`.
@@ -196,8 +195,8 @@ mvn clean package -Plinux-natives,prod  # target/komm-launcher.jar, Linux native
 |---|---|
 | `Launcher` | Entry point — resolves app-data dirs, wires logging, hands off to the UI |
 | `LauncherApp` | The frameless JavaFX window: phases, progress bar, animations; closes on ✕ or Esc |
-| `LauncherConfig` | Reads `app.properties` (`api.url`, `launcher.version`), overridable via `-Dapi.url=` |
-| `update/UpdateManager` | The whole check → download → verify → install → launch sequence on a worker thread |
+| `LauncherConfig` | Reads `app.properties` (`launcher.version`) |
+| `update/UpdateManager` | The whole check → download → verify → install → launch sequence on a worker thread — talks straight to `api.github.com`, repo overridable via `-Dgithub.client.owner=`/`-Dgithub.client.repo=` |
 | `update/BundledClientSeeder` | First-run copy of the bundled client seed into the app-data dir |
 | `update/Phase` | The six status phrases (`CHECKING`, `DOWNLOADING`, `INSTALLING`, `STARTING`, `UP_TO_DATE`, `DONE`) |
 | `ProtocolRegistrar` | `komm://` scheme registration (Windows registry; packaged builds only) |
@@ -229,13 +228,13 @@ mvn clean package -Plinux-natives,prod  # target/komm-launcher.jar, Linux native
 
 **Why a launcher instead of a normal installer?** Komm's client and servers evolve together — the launcher guarantees everyone runs the current client without anyone ever clicking "download update". Install once; every start after that is automatically up to date.
 
-**Does the launcher phone home anywhere else?** No. It makes exactly two requests, both to the hub configured in `app.properties`: one for the latest version, one for the JAR (and the second only when an update is needed).
+**Does the launcher phone home anywhere else?** No. It makes exactly two requests, both to `api.github.com`: one for the latest release, one for the JAR asset (and the second only when an update is needed).
 
 **Do I need Java installed?** No. The installer and AppImage bundle a private jlink runtime that both the launcher and the client run on.
 
-**What happens if an update download fails mid-way?** Nothing bad — the download goes to a temporary file and is verified before it replaces anything. Your working install is only ever replaced by a JAR that proved it's intact. If the hub has announced a new version, though, the update is mandatory: the launcher shows an error rather than starting an outdated client.
+**What happens if an update download fails mid-way?** Nothing bad — the download goes to a temporary file and is verified before it replaces anything. Your working install is only ever replaced by a JAR that proved it's intact. If GitHub has announced a new release, though, the update is mandatory: the launcher shows an error rather than starting an outdated client.
 
-**Can I use the launcher with my own hub?** Yes — pass `-Dapi.url=http://my-hub:8085` in dev, or bake your hub into the package with `-Dhub.url=http://my-hub:8085` at build time (the `prod` profile is just this, preset to the official hub).
+**Can I point the launcher at my own fork's releases?** Yes — pass `-Dgithub.client.owner=you -Dgithub.client.repo=komm` in dev. There's no hub to configure anymore; the launcher talks to GitHub directly.
 
 **How does the launcher itself get updated?** See [How the launcher updates itself](#how-the-launcher-updates-itself) — in short, the *client* checks on the launcher's behalf once per start and swaps it in the background, since the launcher process itself is already gone by the time the client is running.
 
