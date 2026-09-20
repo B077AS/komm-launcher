@@ -1,10 +1,11 @@
 ; Inno Setup script for the Komm installer.
 ; Compiled by the launcher's `installer` Maven profile, which first builds the
-; jpackage app-image (launcher exe + private runtime + bundled client seed) and
-; then passes these defines:
+; jpackage app-image (launcher exe + private runtime, no client jar inside it)
+; and then passes these defines:
 ;   /DAppVersion=...    client version bundled as the seed (drives the setup filename)
 ;   /DAppImageDir=...   the jpackage app-image directory to package
 ;   /DOutputDir=...     where to write the setup exe
+;   /DClientJar=...     the client fat jar to seed into %APPDATA%/Komm/bin/komm.jar
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -14,6 +15,9 @@
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\target\installer"
+#endif
+#ifndef ClientJar
+  #define ClientJar "..\..\..\komm\target\komm-0.0.1.jar"
 #endif
 
 [Setup]
@@ -52,19 +56,24 @@ Name: "italian"; MessagesFile: "compiler:Languages\Italian.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [InstallDelete]
-; Always drop the installed client jar so every (re)install starts from this
-; installer's bundled seed — BundledClientSeeder re-copies it on first launch,
-; and the hub update flow takes over from there. Doubling as a repair path:
-; reinstalling fixes a corrupt jar. Partial downloads, the legacy version.txt
-; and extracted JNativeHook natives (re-extracted by the client on next start)
-; are cleaned up alongside it.
-Type: files; Name: "{userappdata}\Komm\bin\komm.jar"
+; The client jar itself is handled below (Files, ignoreversion — always
+; overwritten, not deleted-then-reseeded). These are leftovers the jar swap
+; itself can't clean up: a partial download, the legacy version.txt, and
+; extracted JNativeHook natives (re-extracted by the client on next start).
 Type: files; Name: "{userappdata}\Komm\bin\komm.jar.download"
 Type: files; Name: "{userappdata}\Komm\bin\version.txt"
 Type: files; Name: "{userappdata}\Komm\bin\JNativeHook-*.dll"
 
 [Files]
 Source: "{#AppImageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Seeds the client straight into the user-data bin dir so the first start
+; works offline — no komm-client-seed.jar detour through the app-image and no
+; BundledClientSeeder copy-on-first-launch step (Windows only; the AppImage
+; still needs that, since it has no separate install phase to hook into).
+; Unconditionally overwritten on every (re)install — same repair-a-corrupt-jar
+; behavior the old delete-then-reseed dance had, just in one step now. The
+; normal GitHub-update flow takes over from the first launch either way.
+Source: "{#ClientJar}"; DestDir: "{userappdata}\Komm\bin"; DestName: "komm.jar"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Komm"; Filename: "{app}\Komm.exe"

@@ -9,23 +9,26 @@ import java.nio.file.StandardCopyOption;
 import java.security.CodeSource;
 
 /**
- * First-run seeding of the client jar bundled inside the installer.
+ * First-run seeding of the client jar bundled inside the AppImage.
  *
- * <p>The exe installer ships {@code komm-client-seed.jar} next to the launcher
- * jar in the app directory. If {@code %APPDATA%/Komm/bin/komm.jar} does not
- * exist yet — i.e. a fresh install — the seed is copied there so the first
- * start works offline and skips a full download. The jar carries its own
- * version in its embedded {@code app.properties}, so no version marker is
- * needed. From then on the normal {@link UpdateManager} flow owns the jar and
- * replaces it with whatever the hub serves.
+ * <p>Linux-only in practice: the AppImage ships {@code komm-client-seed.jar}
+ * next to the launcher jar in the app directory, since an AppImage has no
+ * separate install phase to seed {@code %APPDATA%/Komm/bin/komm.jar} from
+ * directly. The Windows installer does that itself (see {@code komm.iss}'s
+ * {@code [Files]} section) and never stages a seed jar for this class to
+ * find, so this is a harmless no-op there.
  *
- * <p>In dev runs (classes dir instead of a jar, no seed file) this is a no-op.
+ * <p>If {@code %APPDATA%/Komm/bin/komm.jar} does not exist yet — i.e. a fresh
+ * install — the seed is copied there so the first start works offline and
+ * skips a full download. The jar carries its own version in its embedded
+ * {@code app.properties}, so no version marker is needed. From then on the
+ * normal {@link UpdateManager} flow owns the jar and replaces it with
+ * whatever GitHub serves.
+ *
+ * <p>In dev runs (classes dir instead of a jar, no seed file) this is also a no-op.
  */
 @Slf4j
-public final class BundledClientSeeder {
-
-    private BundledClientSeeder() {
-    }
+public class BundledClientSeeder {
 
     /** Best-effort: on any failure the launcher just downloads from the hub as usual. */
     public static void seedIfMissing() {
