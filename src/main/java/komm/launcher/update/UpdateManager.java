@@ -253,6 +253,7 @@ public class UpdateManager {
         Path jar = Launcher.getClientJar();
         Files.move(tmp, jar, StandardCopyOption.REPLACE_EXISTING);
         deleteExtractedNatives(bin);
+        AppsFeaturesVersionUpdater.updateIfInstalled(downloadedVersion);
         log.info("Installed client jar version {} -> {}", downloadedVersion, jar);
     }
 
