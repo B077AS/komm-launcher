@@ -3,34 +3,31 @@
 # The launcher has no version identity outside of this: pom.xml's <version> is
 # never bumped in the tracked source, and jars are only ever built transiently
 # with the version set from the release tag (mirrors the komm client repo's
-# own release workflow). What this uploads is what komm-hub's
-# LauncherReleaseSyncService polls for and what UpdateManager (this repo)
-# downloads on every client start to self-update an already-installed launcher.
+# own release workflow). The two jars this uploads are what UpdateManager
+# (this repo) downloads on every start to self-update an already-installed
+# launcher. Komm's hub has no release awareness at all; the download page
+# just links straight to komm's own GitHub release assets (see that repo's
+# release.yml), and this repo's own self-update check talks to GitHub
+# directly too.
 #
-# Distinct from — and does not replace — the full installer/AppImage build,
-# which still happens from the komm (client) repo's own release workflow,
-# checking out this repo's latest release tag and bundling that jar alongside
-# the client's own runtime/native-elevated packaging (jpackage + Inno Setup /
-# appimagetool). The full AppImage built and uploaded here exists only for
-# that seeding purpose and for fresh installs — it is not itself downloaded
-# to update an already-installed launcher (see below).
-#
-# Windows and Linux apply a self-update differently, but both now just need a
-# plain jar, not a full reinstall's worth of assets:
+# This deliberately does not build an installer or AppImage: the full
+# installer/AppImage for fresh installs is built by the komm (client) repo's
+# own release workflow, which checks out this repo's latest release tag and
+# rebuilds it from source (bundling the client's own fresh jar) rather than
+# downloading anything from here. So a launcher release only ever needs to
+# produce the two plain jars an already-installed launcher applies to itself:
 #   - Windows: the launcher's own code is a discrete jar (app/komm-launcher.jar)
 #     inside an otherwise-untouched, writable install directory. UpdateManager
 #     can't overwrite it directly (this running process has it locked), so it
 #     stages the download and the *client* applies the swap after the launcher
 #     process has already exited (see komm's LauncherUpdateService).
-#   - Linux: an AppImage is one opaque, read-only-mounted unit, so nothing can
-#     write into it in place — but a JVM already running off a path keeps
-#     working off its old inode after that path is atomically replaced
-#     underneath it (POSIX unlink-while-open). UpdateManager writes the new jar
-#     straight to a stable location outside the mount, and the launcher
-#     relaunches into it on its own next start (see Launcher.main's
-#     relaunchIfNewerLauncherStaged). The full .AppImage only needs to be
-#     manually reinstalled again if the bundled runtime itself must change,
-#     which should be rare.
+#   - Linux: a JVM already running off a path keeps working off its old inode
+#     after that path is atomically replaced underneath it (POSIX
+#     unlink-while-open). UpdateManager writes the new jar straight to a
+#     stable location, and the launcher relaunches into it on its own next
+#     start (see Launcher.main's relaunchIfNewerLauncherStaged). If the
+#     bundled runtime itself ever needs to change, that still requires
+#     manually reinstalling the AppImage from komm's release page.
 
 name: Release
 
@@ -75,30 +72,9 @@ jobs:
           mvn -B clean package -Plinux-natives
           cp target/komm-launcher.jar komm-launcher-linux.jar
 
-      - name: Get latest client jar (AppImage seed)
-        id: client-jar
-        run: |
-          gh release download --repo B077AS/komm --pattern "komm-*.jar" --dir client-jar
-          echo "client_jar=$(ls client-jar/*.jar | head -1)" >> "$GITHUB_OUTPUT"
-
-      - name: Install appimagetool
-        run: |
-          mkdir -p ~/.local/bin
-          curl -Lo ~/.local/bin/appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x ~/.local/bin/appimagetool
-
-      - name: Build Linux AppImage
-        run: |
-          mvn -B clean package -Pappimage \
-            "-Dclient.version=${{ steps.v.outputs.version }}" \
-            "-Dclient.jar=${{ steps.client-jar.outputs.client_jar }}"
-          cp target/appimage/Komm-*.AppImage komm-launcher-linux.AppImage
-
       - name: Attach artifacts to the release
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             komm-launcher-windows.jar \
             komm-launcher-linux.jar \
-            komm-launcher-linux.AppImage \
             --clobber -R "$GITHUB_REPOSITORY"
