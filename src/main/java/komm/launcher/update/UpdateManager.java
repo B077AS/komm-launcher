@@ -72,6 +72,13 @@ public class UpdateManager {
     private static final String GITHUB_CLIENT_OWNER = systemPropertyOr("github.client.owner", "B077AS");
     private static final String GITHUB_CLIENT_REPO = systemPropertyOr("github.client.repo", "komm");
 
+    /** Public GitHub repo the launcher checks for its own updates — same repo this code lives
+     *  in, self-referentially; overridable for testing against a fork. */
+    private static final String GITHUB_LAUNCHER_OWNER = systemPropertyOr("github.launcher.owner", "B077AS");
+    private static final String GITHUB_LAUNCHER_REPO = systemPropertyOr("github.launcher.repo", "komm-launcher");
+    private static final String WINDOWS_LAUNCHER_ASSET = "komm-launcher-windows.jar";
+    private static final String LINUX_LAUNCHER_ASSET = "komm-launcher-linux.jar";
+
     private final LauncherConfig config = LauncherConfig.getInstance();
     private final Gson gson = new Gson();
     private final HttpClient http = HttpClient.newBuilder()
@@ -109,6 +116,10 @@ public class UpdateManager {
     public void run() {
         BundledClientSeeder.seedIfMissing();
         deleteLegacyVersionFile();
+        // Fire-and-forget: the launcher's own update must never delay or block
+        // the client update/launch flow below, so it runs on its own thread and
+        // is entirely best-effort (see checkAndStageLauncherUpdate's javadoc).
+        Thread.ofVirtual().start(this::checkAndStageLauncherUpdate);
 
         Path jar = Launcher.getClientJar();
         // Flipped once GitHub has announced a version we don't have; from that
@@ -159,9 +170,10 @@ public class UpdateManager {
         }
     }
 
-    /** {@code GET /repos/{owner}/{repo}/releases/latest}, resolved down to the jar asset this launcher wants. */
-    private ResolvedRelease fetchLatest() throws Exception {
-        String url = "https://api.github.com/repos/" + GITHUB_CLIENT_OWNER + "/" + GITHUB_CLIENT_REPO + "/releases/latest";
+    /** {@code GET /repos/{owner}/{repo}/releases/latest}, raw — shared by the client
+     *  check below and the launcher's own self-update check. */
+    private GithubRelease fetchLatestRelease(String owner, String repo) throws Exception {
+        String url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
         log.debug("GET {}", url);
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                 .header("Accept", "application/vnd.github+json")
@@ -175,6 +187,12 @@ public class UpdateManager {
         if (release == null || release.getTagName() == null) {
             throw new IllegalStateException("Malformed GitHub release response");
         }
+        return release;
+    }
+
+    /** Resolved down to the jar asset this launcher wants for the client. */
+    private ResolvedRelease fetchLatest() throws Exception {
+        GithubRelease release = fetchLatestRelease(GITHUB_CLIENT_OWNER, GITHUB_CLIENT_REPO);
         String tagName = release.getTagName();
         String version = tagName.startsWith("v") ? tagName.substring(1) : tagName;
 
@@ -196,6 +214,86 @@ public class UpdateManager {
                 .downloadUrl(asset.getBrowserDownloadUrl())
                 .sha256(sha256)
                 .build();
+    }
+
+    /**
+     * Checks GitHub for a newer launcher than this one and stages it for
+     * installation. Best-effort throughout — any failure is logged and
+     * swallowed, since this must never interfere with the client update/launch
+     * flow it runs alongside (see the fire-and-forget call in {@link #run()}).
+     *
+     * <p>Windows can't overwrite its own currently-loaded {@code app/komm-launcher.jar}
+     * — this running process has it locked — so the download is staged at
+     * {@code bin/komm-launcher.jar.pending} instead, and applied by the client
+     * on its next start, once this launcher process has already exited (see the
+     * client's {@code LauncherUpdateService}).
+     *
+     * <p>Linux has no such lock: a JVM already running off a path keeps working
+     * off its old inode after that path is atomically replaced underneath it
+     * (POSIX unlink-while-open), so the download goes straight to the stable
+     * {@code bin/komm-launcher.jar}; no separate pending file needed. {@link
+     * Launcher#main} checks for that file itself on every start and relaunches
+     * into it before doing anything else.
+     */
+    private void checkAndStageLauncherUpdate() {
+        try {
+            String currentVersion = config.getLauncherVersion();
+            GithubRelease release = fetchLatestRelease(GITHUB_LAUNCHER_OWNER, GITHUB_LAUNCHER_REPO);
+            String tagName = release.getTagName();
+            String latestVersion = tagName.startsWith("v") ? tagName.substring(1) : tagName;
+            if (latestVersion.equals(currentVersion)) {
+                log.debug("Launcher is up to date (version {})", currentVersion);
+                return;
+            }
+
+            boolean win = Platform.isWindows();
+            String assetName = win ? WINDOWS_LAUNCHER_ASSET : LINUX_LAUNCHER_ASSET;
+            GithubRelease.GithubAsset asset = release.findAsset(assetName);
+            if (asset == null || asset.getBrowserDownloadUrl() == null) {
+                log.debug("Launcher release {} has no asset named {} yet", latestVersion, assetName);
+                return;
+            }
+
+            log.info("Launcher update available: {} -> {}", currentVersion, latestVersion);
+            byte[] bytes = downloadBytes(asset.getBrowserDownloadUrl());
+            if (bytes.length == 0 || !digestMatches(bytes, asset.getDigest())) {
+                log.warn("Downloaded launcher update failed integrity check; discarding");
+                return;
+            }
+
+            Path bin = Launcher.getBinDirectory();
+            Files.createDirectories(bin);
+            String targetName = win ? "komm-launcher.jar.pending" : "komm-launcher.jar";
+            Path target = bin.resolve(targetName);
+            Path tmp = bin.resolve(targetName + ".download");
+            Files.write(tmp, bytes);
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+            log.info(win ? "Staged launcher update at {} for the client to apply"
+                          : "Installed launcher update at {} (applied on next start)", target);
+        } catch (Exception e) {
+            log.debug("Launcher self-update check failed (non-fatal): {}", e.toString());
+        }
+    }
+
+    private byte[] downloadBytes(String url) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url)).GET().build();
+        HttpResponse<InputStream> res = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+        if (res.statusCode() != 200) {
+            throw new IllegalStateException("Download failed: HTTP " + res.statusCode());
+        }
+        try (InputStream in = res.body()) {
+            return in.readAllBytes();
+        }
+    }
+
+    /** True if {@code digestHeader} (GitHub's {@code sha256:<hex>} asset digest) matches
+     *  {@code bytes}, or if GitHub didn't report one (older uploads predating this feature). */
+    private boolean digestMatches(byte[] bytes, String digestHeader) throws Exception {
+        if (digestHeader == null || digestHeader.isBlank()) return true;
+        String expected = digestHeader.startsWith("sha256:") ? digestHeader.substring("sha256:".length()) : digestHeader;
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        String actual = HexFormat.of().formatHex(digest.digest(bytes));
+        return expected.trim().equalsIgnoreCase(actual);
     }
 
     private void downloadAndInstall(ResolvedRelease latest) throws Exception {
