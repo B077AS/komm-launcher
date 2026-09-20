@@ -73,28 +73,30 @@ This repo is the thing you actually download from [kommvoice.com/download](https
 
 ## How the launcher updates itself
 
-Everything above updates the *client*. But the launcher binary itself (the installer/AppImage you actually have on disk) has no equivalent "check on every start," because by the time there'd be anything to check, the launcher has already handed off to the client and exited. So **the client checks on the launcher's behalf**, once per start, and swaps it in the background:
+The launcher checks GitHub for its own latest release too, alongside the client check, on every start; `UpdateManager` owns both. Checking here rather than from the client matters: it means the launcher gets updated independently of whether the client can even start, instead of depending on a chain that runs through the very thing it's trying to fix.
 
 ```
-┌──────────────┐  -Dlauncher.version=X   ┌──────────────┐  GET api.github.com/repos/…/releases/latest  ┌──────────────┐
-│   Launcher   │ ──────────────────────► │ komm client  │ ─────────────────────────────────────────────►│    GitHub    │
-│  (this repo) │   forwarded at launch   │  (komm.jar)  │◄────────────────────────────────────────────  │              │
-└──────────────┘                         └──────┬───────┘  { tag_name, assets: [{ name, url, digest }] } └──────────────┘
-                                                 │
-                                                 │  stale (or version missing entirely)?
-                                                 │  download the per-OS asset, verify against GitHub's
-                                                 │  digest, swap, in the background
-                                                 ▼
-                                   Windows: overwrite app/komm-launcher.jar
-                                   Linux:   overwrite the .AppImage at $APPIMAGE
+┌──────────────┐  GET api.github.com/repos/…/releases/latest   ┌──────────────┐
+│   Launcher   │ ───────────────────────────────────────────► │    GitHub    │
+│  (this repo) │ ◄───────────────────────────────────────────  │              │
+└──────┬───────┘   { tag_name, assets: [{ name, url, digest }] } └──────────────┘
+       │
+       │  stale? download the per-OS asset, verify against GitHub's digest
+       ▼
+  Windows: stage bin/komm-launcher.jar.pending (this process still has
+           app/komm-launcher.jar locked); the client applies it on its
+           next start, once this process has already exited
+  Linux:   write straight to bin/komm-launcher.jar (safe even while
+           this process still has the old one open); Launcher.main
+           relaunches into it on its own next start
 ```
 
-- **The launcher is self-describing**, the same way the client JAR is: `launcher.version` in `app.properties`, set from this repo's own GitHub release tag at build time (see [Under the hood](#under-the-hood): `LauncherConfig.getLauncherVersion()`). `UpdateManager` forwards it to the client as `-Dlauncher.version=...` when spawning it.
-- **A missing version means "definitely outdated."** Launchers built before this existed simply don't pass the flag at all; the client treats that exactly like this repo's own `UpdateManager` treats a missing client version: assume stale, update.
-- **Windows and Linux need genuinely different artifacts, not just different natives.** On Windows, the launcher's own code is a discrete jar (`app/komm-launcher.jar`) inside an otherwise-untouched install directory, so the client just overwrites that one file; safe even while the client is running, since the launcher process that loaded it has already exited (`closeLauncher()` calls `System.exit()` right after spawning the client). On Linux there's no equivalent: an AppImage is one opaque, read-only-mounted unit, so "update the launcher" means replacing the *entire* `.AppImage` the client is running from; also safe while mounted, thanks to ordinary POSIX unlink-while-open semantics: the running instance keeps working off the old file until it next exits, the *path* just points somewhere new from then on.
+- **The launcher is self-describing**, the same way the client JAR is: `launcher.version` in `app.properties`, set from this repo's own GitHub release tag at build time (see [Under the hood](#under-the-hood): `LauncherConfig.getLauncherVersion()`).
+- **Windows and Linux apply the update differently, because of one filesystem difference.** A JVM can't overwrite the jar it's currently running from on Windows; the file stays locked for as long as the process holds it. So on Windows, `UpdateManager` stages the download at `bin/komm-launcher.jar.pending` instead of swapping it in directly, and the *client* applies it on its next start (see `komm`'s `LauncherUpdateService`), strictly after this launcher process has already exited (`closeLauncher()` calls `System.exit()` right after spawning the client). Linux has no such lock: a JVM already running off a path keeps working off its old inode after that path is atomically replaced underneath it (POSIX unlink-while-open), so `UpdateManager` writes straight to the stable `bin/komm-launcher.jar`, and `Launcher.main`'s `relaunchIfNewerLauncherStaged` picks it up by relaunching into it on the launcher's own next start, no client involvement needed.
+- **The full AppImage is still built and published on every release** (`komm-launcher-linux.AppImage`), but it's no longer what gets downloaded to update an already-installed launcher; that's the plain `komm-launcher-linux.jar` now. The full AppImage exists for fresh installs, and for the rare case where the bundled runtime itself needs to change, which still needs a manual reinstall.
 - **Old installs self-repair, once.** Installs built before the launcher jar's filename was pinned to a constant (`komm-launcher.jar`, see `<finalName>` in `pom.xml`) have jpackage's `Komm.cfg` pointing at the old versioned name (`komm-launcher-0.0.1.jar`, etc.). The first swap on such an install also repoints `Komm.cfg` and deletes the stale jar; after that it's permanently on the fixed-name scheme and every future update is a plain file swap.
-- **No UI, no restart prompt.** The swap is entirely passive; the new version is picked up the next time the user launches through the (already-updated) launcher, whenever that is.
-- **This is why the launcher has its own release pipeline**: `.github/workflows/release.yml` in *this* repo, separate from the client's, publishing `komm-launcher-windows.jar` and `komm-launcher-linux.AppImage` on every launcher release. It's deliberately decoupled from client release cadence, so a launcher-only fix reaches every installed user, even the very first launcher ever shipped, without waiting on the next client release.
+- **No UI, no restart prompt.** The swap is entirely passive; the new version is picked up the next time the launcher starts (or, on Linux, this run relaunches into it immediately).
+- **This is why the launcher has its own release pipeline**: `.github/workflows/release.yml` in *this* repo, separate from the client's, publishing `komm-launcher-windows.jar`, `komm-launcher-linux.jar` and `komm-launcher-linux.AppImage` on every launcher release. It's deliberately decoupled from client release cadence, so a launcher-only fix reaches every installed user, even the very first launcher ever shipped, without waiting on the next client release.
 
 ## Invite links (`komm://`)
 
@@ -195,16 +197,16 @@ mvn clean package -Pwin-natives    # target/komm-launcher.jar, Windows natives
 mvn clean package -Plinux-natives  # target/komm-launcher.jar, Linux natives
 ```
 
-`.github/workflows/release.yml` in this repo uses these to build `komm-launcher-windows.jar` directly, and (via the existing `appimage` profile, seeded with whatever the latest published [komm](https://github.com/B077AS/komm) client jar happens to be) `komm-launcher-linux.AppImage`.
+`.github/workflows/release.yml` in this repo uses these to build `komm-launcher-windows.jar` and `komm-launcher-linux.jar` directly; these two are what an already-installed launcher downloads to update itself. It also builds `komm-launcher-linux.AppImage` (via the existing `appimage` profile, seeded with whatever the latest published [komm](https://github.com/B077AS/komm) client jar happens to be) for fresh installs, but that one is never itself downloaded by a running launcher.
 
 ## Under the hood
 
 | Class | Responsibility |
 |---|---|
-| `Launcher` | Entry point: resolves app-data dirs, wires logging, hands off to the UI |
+| `Launcher` | Entry point: resolves app-data dirs, wires logging, hands off to the UI. On Linux/AppImage, `relaunchIfNewerLauncherStaged` also checks for a self-staged update and relaunches into it before anything else runs |
 | `LauncherApp` | The frameless JavaFX window: phases, progress bar, animations; closes on ✕ or Esc |
 | `LauncherConfig` | Reads `app.properties` (`launcher.version`) |
-| `update/UpdateManager` | The whole check → download → verify → install → launch sequence on a worker thread; talks straight to `api.github.com`, repo overridable via `-Dgithub.client.owner=`/`-Dgithub.client.repo=` |
+| `update/UpdateManager` | The whole check → download → verify → install → launch sequence for the client, on a worker thread; talks straight to `api.github.com`, repo overridable via `-Dgithub.client.owner=`/`-Dgithub.client.repo=`. Also checks and stages the launcher's own update in the background (see [How the launcher updates itself](#how-the-launcher-updates-itself)) |
 | `update/BundledClientSeeder` | Linux/AppImage only: first-run copy of the bundled client seed into the app-data dir (Windows seeds via Inno Setup instead, see [What's inside](#whats-inside-the-installer--appimage)) |
 | `update/AppsFeaturesVersionUpdater` | Windows only: nudges the Inno Setup uninstall entry's `DisplayVersion` after every jar swap, so "Apps & Features" doesn't show the version from whenever the .exe was last run |
 | `update/Phase` | The six status phrases (`CHECKING`, `DOWNLOADING`, `INSTALLING`, `STARTING`, `UP_TO_DATE`, `DONE`) |
@@ -237,7 +239,7 @@ mvn clean package -Plinux-natives  # target/komm-launcher.jar, Linux natives
 
 **Why a launcher instead of a normal installer?** Komm's client and servers evolve together; the launcher guarantees everyone runs the current client without anyone ever clicking "download update". Install once; every start after that is automatically up to date.
 
-**Does the launcher phone home anywhere else?** No. It makes exactly two requests, both to `api.github.com`: one for the latest release, one for the JAR asset (and the second only when an update is needed).
+**Does the launcher phone home anywhere else?** No. Every request goes to `api.github.com`: one release lookup and one asset download for the client, and the same pair for the launcher's own self-update check, with asset downloads only happening when an update is actually needed.
 
 **Do I need Java installed?** No. The installer and AppImage bundle a private jlink runtime that both the launcher and the client run on.
 
@@ -245,7 +247,7 @@ mvn clean package -Plinux-natives  # target/komm-launcher.jar, Linux natives
 
 **Can I point the launcher at my own fork's releases?** Yes: pass `-Dgithub.client.owner=you -Dgithub.client.repo=komm` in dev. There's no hub to configure anymore; the launcher talks to GitHub directly.
 
-**How does the launcher itself get updated?** See [How the launcher updates itself](#how-the-launcher-updates-itself); in short, the *client* checks on the launcher's behalf once per start and swaps it in the background, since the launcher process itself is already gone by the time the client is running.
+**How does the launcher itself get updated?** See [How the launcher updates itself](#how-the-launcher-updates-itself); in short, the launcher checks GitHub for its own updates directly, the same way it checks for the client's. Applying the update differs by platform: on Windows the client applies a staged swap on its next start (the launcher can't overwrite its own locked jar), while on Linux the launcher relaunches into the update itself, no client involvement needed.
 
 ## License
 

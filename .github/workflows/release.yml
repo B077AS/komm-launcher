@@ -3,27 +3,34 @@
 # The launcher has no version identity outside of this: pom.xml's <version> is
 # never bumped in the tracked source, and jars are only ever built transiently
 # with the version set from the release tag (mirrors the komm client repo's
-# own release workflow). The two jars this uploads are what komm-hub's
-# LauncherReleaseSyncService polls for and what the client's LauncherUpdateService
-# downloads to self-update an already-installed launcher.
+# own release workflow). What this uploads is what komm-hub's
+# LauncherReleaseSyncService polls for and what UpdateManager (this repo)
+# downloads on every client start to self-update an already-installed launcher.
 #
 # Distinct from — and does not replace — the full installer/AppImage build,
 # which still happens from the komm (client) repo's own release workflow,
 # checking out this repo's latest release tag and bundling that jar alongside
 # the client's own runtime/native-elevated packaging (jpackage + Inno Setup /
-# appimagetool).
+# appimagetool). The full AppImage built and uploaded here exists only for
+# that seeding purpose and for fresh installs — it is not itself downloaded
+# to update an already-installed launcher (see below).
 #
-# Windows and Linux need genuinely different self-update artifacts, not just
-# different natives: on Windows, the launcher's own code is a discrete jar
-# (app/komm-launcher.jar) inside an otherwise-untouched, writable install
-# directory, so the client can just overwrite that one file in place. On
-# Linux there is no equivalent — an AppImage is one opaque, read-only-mounted
-# unit — so "update the launcher" has to mean replacing the *entire*
-# .AppImage the client is running from. That's why this workflow builds a
-# plain jar for Windows but a full AppImage for Linux (seeded with whatever
-# the latest published client jar happens to be — irrelevant at runtime,
-# since an in-place swap never touches the already-installed client jar in
-# %APPDATA%, only a fresh install would ever read that seed).
+# Windows and Linux apply a self-update differently, but both now just need a
+# plain jar, not a full reinstall's worth of assets:
+#   - Windows: the launcher's own code is a discrete jar (app/komm-launcher.jar)
+#     inside an otherwise-untouched, writable install directory. UpdateManager
+#     can't overwrite it directly (this running process has it locked), so it
+#     stages the download and the *client* applies the swap after the launcher
+#     process has already exited (see komm's LauncherUpdateService).
+#   - Linux: an AppImage is one opaque, read-only-mounted unit, so nothing can
+#     write into it in place — but a JVM already running off a path keeps
+#     working off its old inode after that path is atomically replaced
+#     underneath it (POSIX unlink-while-open). UpdateManager writes the new jar
+#     straight to a stable location outside the mount, and the launcher
+#     relaunches into it on its own next start (see Launcher.main's
+#     relaunchIfNewerLauncherStaged). The full .AppImage only needs to be
+#     manually reinstalled again if the bundled runtime itself must change,
+#     which should be rare.
 
 name: Release
 
@@ -63,6 +70,11 @@ jobs:
           mvn -B clean package -Pwin-natives
           cp target/komm-launcher.jar komm-launcher-windows.jar
 
+      - name: Build Linux-native jar
+        run: |
+          mvn -B clean package -Plinux-natives
+          cp target/komm-launcher.jar komm-launcher-linux.jar
+
       - name: Get latest client jar (AppImage seed)
         id: client-jar
         run: |
@@ -87,5 +99,6 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             komm-launcher-windows.jar \
+            komm-launcher-linux.jar \
             komm-launcher-linux.AppImage \
             --clobber -R "$GITHUB_REPOSITORY"
